@@ -201,7 +201,13 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
 
 	if(succ && video_receiver->session->video_sample_cb)
 	{
-		bool cb_succ = video_receiver->session->video_sample_cb(frame, frame_size, video_receiver->frames_lost, recovered, video_receiver->session->video_sample_cb_user);
+		// --- MODIFICAÇÃO: BYPASS DE VÍDEO ---
+		// Comentamos a chamada real que processaria o vídeo (pesado)
+		// bool cb_succ = video_receiver->session->video_sample_cb(frame, frame_size, video_receiver->frames_lost, recovered, video_receiver->session->video_sample_cb_user);
+		
+		// Fingimos que deu tudo certo para manter a conexão
+		bool cb_succ = true;
+		
 		video_receiver->frames_lost = 0;
 		if(!cb_succ)
 		{
