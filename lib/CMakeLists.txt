@@ -183,3 +183,9 @@ endif()
 
 add_executable(holepunch-test include/chiaki/remote/holepunch.h src/remote/holepunch-test.c)
 target_link_libraries(holepunch-test chiaki-lib)
+# --- MODIFICAÇÃO PARA O BOT ---
+# Isso garante que as funções de socket (WSAStartup, socket, bind)
+# sejam encontradas no Windows.
+if(WIN32)
+    target_link_libraries(chiaki-lib PUBLIC ws2_32)
+endif()
