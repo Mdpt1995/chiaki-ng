@@ -2,10 +2,33 @@
 
 #include <chiaki/feedbacksender.h>
 
-#define FEEDBACK_STATE_TIMEOUT_MIN_MS 8 // minimum time to wait between sending 2 packets
-#define FEEDBACK_STATE_TIMEOUT_MAX_MS 200 // maximum time to wait between sending 2 packets
+// --- INICIO DAS BIBLIOTECAS DE REDE (PARA O BOT) ---
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+// O link com ws2_32.lib será feito no CMakeLists.txt depois
+#else
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <fcntl.h>
+#endif
+// ---------------------------------------------------
 
+#define FEEDBACK_STATE_TIMEOUT_MIN_MS 8 
+#define FEEDBACK_STATE_TIMEOUT_MAX_MS 200
 #define FEEDBACK_HISTORY_BUFFER_SIZE 0x10
+
+// Estrutura do Pacote que seu Python/C# deve enviar
+typedef struct {
+	int16_t left_x;      // -32768 a 32767
+	int16_t left_y;
+	int16_t right_x;
+	int16_t right_y;
+	uint16_t buttons;    // Bitmask dos botões
+	uint8_t l2;          // 0 a 255
+	uint8_t r2;          // 0 a 255
+} BotInputPacket;
 
 static void *feedback_sender_thread_func(void *user);
 
@@ -155,8 +178,6 @@ static void feedback_sender_send_history_packet(ChiakiFeedbackSender *feedback_s
 		return;
 	}
 
-	//CHIAKI_LOGD(feedback_sender->log, "Feedback History:");
-	//chiaki_log_hexdump(feedback_sender->log, CHIAKI_LOG_DEBUG, buf, buf_size);
 	chiaki_takion_send_feedback_history(feedback_sender->takion, feedback_sender->history_seq_num++, buf, buf_size);
 }
 
@@ -235,55 +256,104 @@ static void feedback_sender_send_history(ChiakiFeedbackSender *feedback_sender)
 	}
 }
 
-static bool state_cond_check(void *user)
-{
-	ChiakiFeedbackSender *feedback_sender = user;
-	return feedback_sender->should_stop || feedback_sender->controller_state_changed;
-}
-
+// --- FUNÇÃO DO SERVIDOR UDP E LOOP 1MS ---
 static void *feedback_sender_thread_func(void *user)
 {
 	ChiakiFeedbackSender *feedback_sender = user;
 
-	ChiakiErrorCode err = chiaki_mutex_lock(&feedback_sender->state_mutex);
-	if(err != CHIAKI_ERR_SUCCESS)
-		return NULL;
+	// 1. CONFIGURAÇÃO DO SOCKET UDP
+	int sockfd;
+	struct sockaddr_in servaddr, cliaddr;
 
-	uint64_t next_timeout = FEEDBACK_STATE_TIMEOUT_MAX_MS;
+#ifdef _WIN32
+	WSADATA wsaData;
+	WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif
+
+	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+
+	// Non-blocking mode
+#ifdef _WIN32
+	u_long mode = 1;
+	ioctlsocket(sockfd, FIONBIO, &mode);
+#else
+	int flags = fcntl(sockfd, F_GETFL, 0);
+	fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+	memset(&servaddr, 0, sizeof(servaddr));
+	servaddr.sin_family = AF_INET;
+	servaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
+	servaddr.sin_port = htons(5555); // Porta 5555
+
+	bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr));
+
+	ChiakiErrorCode err = chiaki_mutex_lock(&feedback_sender->state_mutex);
+	if(err != CHIAKI_ERR_SUCCESS) return NULL;
+
+	BotInputPacket bot_packet;
+	int n;
+#ifdef _WIN32
+	int len = sizeof(cliaddr);
+#else
+	socklen_t len = sizeof(cliaddr);
+#endif
+
+	// 2. LOOP INFINITO DE 1MS
 	while(true)
 	{
-		err = chiaki_cond_timedwait_pred(&feedback_sender->state_cond, &feedback_sender->state_mutex, next_timeout, state_cond_check, feedback_sender);
-		if(err != CHIAKI_ERR_SUCCESS && err != CHIAKI_ERR_TIMEOUT)
-			break;
-
 		if(feedback_sender->should_stop)
 			break;
 
-		bool send_feedback_state = true;
-		bool send_feedback_history = false;
+		// Lê do Socket (Python/C#)
+		n = recvfrom(sockfd, (char *)&bot_packet, sizeof(BotInputPacket), 
+					 0, (struct sockaddr *)&cliaddr, &len);
 
+		if (n == sizeof(BotInputPacket)) {
+			// Atualiza estado com dados do Bot
+			feedback_sender->controller_state.left_x = bot_packet.left_x;
+			feedback_sender->controller_state.left_y = bot_packet.left_y;
+			feedback_sender->controller_state.right_x = bot_packet.right_x;
+			feedback_sender->controller_state.right_y = bot_packet.right_y;
+			feedback_sender->controller_state.buttons = bot_packet.buttons; // Cuidado com mapeamento de bits
+			feedback_sender->controller_state.l2_state = bot_packet.l2;
+			feedback_sender->controller_state.r2_state = bot_packet.r2;
+			feedback_sender->controller_state_changed = true;
+		}
+
+		// Envia para o PS5 (Sem checagem, envia sempre para garantir 1000hz)
+		feedback_sender_send_state(feedback_sender);
+
+		bool send_feedback_history = false;
 		if(feedback_sender->controller_state_changed)
 		{
-			// TODO: FEEDBACK_STATE_TIMEOUT_MIN_MS
-			feedback_sender->controller_state_changed = false;
-
-			// don't need to send feedback state if nothing relevant changed
-			if(controller_state_equals_for_feedback_state(&feedback_sender->controller_state, &feedback_sender->controller_state_prev))
-				send_feedback_state = false;
-
 			send_feedback_history = !controller_state_equals_for_feedback_history(&feedback_sender->controller_state, &feedback_sender->controller_state_prev);
-		} // else: timeout
-
-		if(send_feedback_state)
-			feedback_sender_send_state(feedback_sender);
+			feedback_sender->controller_state_changed = false;
+		}
 
 		if(send_feedback_history)
 			feedback_sender_send_history(feedback_sender);
 
 		feedback_sender->controller_state_prev = feedback_sender->controller_state;
+
+		// Libera Mutex, Dorme 1ms e Trava Mutex
+		chiaki_mutex_unlock(&feedback_sender->state_mutex);
+#ifdef _WIN32
+		Sleep(1);
+#else
+		usleep(1000);
+#endif
+		chiaki_mutex_lock(&feedback_sender->state_mutex);
 	}
 
 	chiaki_mutex_unlock(&feedback_sender->state_mutex);
+
+#ifdef _WIN32
+	closesocket(sockfd);
+	WSACleanup();
+#else
+	close(sockfd);
+#endif
 
 	return NULL;
 }
